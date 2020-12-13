@@ -19,18 +19,6 @@ def torch2uint8(x):
     return x
 
 
-# def my_torch2uint8(x):
-#     x = x.permute((0, 2, 3, 1))
-#     x = functions.denorm(x)
-#     try:
-#         x = x.cpu().numpy()
-#     except:
-#         x = x.detach().cpu().numpy()
-#     x = np.clip(x, 0, 1)
-#     x = x * 255
-#     x = x.astype(np.uint8)
-#     return x
-
 def my_torch2uint8(x):
     x = x.permute((0, 2, 3, 1))
     x = 255 * functions.denorm(x)

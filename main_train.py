@@ -12,8 +12,9 @@ import utils.functions as functions
 # noinspection PyInterpreter
 if __name__ == '__main__':
     parser = get_arguments()
-    parser.add_argument('--input_name', help='input image name for training', default="/home/henry/Datasets/NWPU")
-    parser.add_argument('--input_image_size', help='the size of input image', default=(256, 256))
+    parser.add_argument('--train_images', help='input image name for training')
+    parser.add_argument('--test_images', help='input image name for testing')
+    parser.add_argument('--val_images', help='input image name for validation')
     parser.add_argument('--gpu', type=str, help='which GPU to use', default="0")
     parser.add_argument('--lr_scale', type=float, help='scaling of learning rate for lower stages', default=0.5)
     parser.add_argument('--train_stages', type=int, help='how many stages to use for training', default=5)

@@ -1,19 +1,10 @@
+# -*- coding: utf-8 -*- #
+# Author: Henry
+# Date:   2020/7/16
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import copy
-import functools
-
-from .models_new import PyConv2d
-
-
-# def weights_init(m):
-#     classname = m.__class__.__name__
-#     if classname.find('Conv2d') != -1:
-#         m.weight.data.normal_(0.0, 0.02)
-#     elif classname.find('Norm') != -1:
-#         m.weight.data.normal_(1.0, 0.02)
-#         m.bias.data.fill_(0)
 
 
 def weights_init(net):
@@ -29,7 +20,8 @@ def get_activation(opt):
     activations = {"lrelu": nn.LeakyReLU(opt.lrelu_alpha, inplace=True),
                    "elu": nn.ELU(alpha=1.0, inplace=True),
                    "prelu": nn.PReLU(num_parameters=1, init=0.25),
-                   "selu": nn.SELU(inplace=True)
+                   "selu": nn.SELU(inplace=True),
+                   "relu": nn.ReLU(inplace=True)
                    }
     return activations[opt.activation]
 
@@ -37,13 +29,6 @@ def get_activation(opt):
 def upsample(x, size):
     x_up = torch.nn.functional.interpolate(x, size=size, mode='bicubic', align_corners=True)
     return x_up
-
-
-def make_layer(block, n_layers):
-    layers = []
-    for _ in range(n_layers):
-        layers.append(block())
-    return nn.Sequential(*layers)
 
 
 class ConvBlock(nn.Sequential):
@@ -55,174 +40,210 @@ class ConvBlock(nn.Sequential):
         self.add_module(opt.activation, get_activation(opt))
 
 
-class ResidualDenseBlock5C(nn.Module):
-    def __init__(self, nf=64, gc=32, kernel=3, pad=1, bias=True):
-        super(ResidualDenseBlock5C, self).__init__()
-        # gc: growth channel, i.e. intermediate channels
-        # self.conv1 = nn.Conv2d(nf, gc, kernel, 1, pad, bias=bias)
-        # self.conv2 = nn.Conv2d(nf + gc, gc, kernel, 1, pad, bias=bias)
-        # self.conv3 = nn.Conv2d(nf + 2 * gc, gc, kernel, 1, pad, bias=bias)
-        # self.conv4 = nn.Conv2d(nf + 3 * gc, gc, kernel, 1, pad, bias=bias)
-        # self.conv5 = nn.Conv2d(nf + 4 * gc, nf, kernel, 1, pad, bias=bias)
-        self.conv1 = PyConv2d(nf, gc)
-        self.conv2 = PyConv2d(nf + gc, gc)
-        self.conv3 = PyConv2d(nf + 2 * gc, gc)
-        self.conv4 = PyConv2d(nf + 3 * gc, gc)
-        self.conv5 = PyConv2d(nf + 4 * gc, nf)
-        self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+class UpBlock(torch.nn.Module):
+    def __init__(self, num_filters, kernel=3, stride=1, padding=1, bias=True):
+        super(UpBlock, self).__init__()
+        self.conv1 = nn.Conv2d(num_filters, num_filters, kernel, stride, padding, bias=bias)
+        self.deconv1 = nn.ConvTranspose2d(num_filters, num_filters, kernel, stride, padding)
+        self.deconv2 = nn.ConvTranspose2d(num_filters, num_filters, kernel, stride, padding)
+        self.prelu = nn.PReLU()
 
-        # initialization
-        # mutil.initialize_weights([self.conv1, self.conv2, self.conv3, self.conv4, self.conv5], 0.1)
-
-    def forward(self, x):
-        x1 = self.lrelu(self.conv1(x))
-        x2 = self.lrelu(self.conv2(torch.cat((x, x1), 1)))
-        x3 = self.lrelu(self.conv3(torch.cat((x, x1, x2), 1)))
-        x4 = self.lrelu(self.conv4(torch.cat((x, x1, x2, x3), 1)))
-        x5 = self.conv5(torch.cat((x, x1, x2, x3, x4), 1))
-        return x5 * 0.2 + x
+    def forward(self, x, size):
+        size[1] = x.shape[1]
+        h0 = self.prelu(self.deconv1(x, output_size=size))
+        l0 = self.prelu(self.conv1(h0))
+        h1 = self.prelu(self.deconv2(l0 - x, output_size=size))
+        return h1 + h0
 
 
-class RRDB(nn.Module):
-    """Residual in Residual Dense Block"""
-    def __init__(self, opt):
-        super(
-            RRDB, self).__init__()
-        self.RDB1 = ResidualDenseBlock5C(opt.nf, opt.gc, opt.ker_size, opt.padd_size)
-        self.RDB2 = ResidualDenseBlock5C(opt.nf, opt.gc, opt.ker_size, opt.padd_size)
-        self.RDB3 = ResidualDenseBlock5C(opt.nf, opt.gc, opt.ker_size, opt.padd_size)
+class AttentionLayer(nn.Module):
+    def __init__(self, channels, reduction=4):
+        super(AttentionLayer, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+
+        self.con_du = nn.Sequential(
+            nn.Conv2d(channels, channels // reduction, 1, padding=0, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, 1, padding=0, bias=True),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
-        out = self.RDB1(x)
-        out = self.RDB2(out)
-        out = self.RDB3(out)
-        return out * 0.2 + x
+        y = self.avg_pool(x)
+        y = self.con_du(y)
+        return x * y
 
 
-class GrowingGenerator(nn.Module):
+class PyConv2dAttention(nn.Module):
+    """PyConv2d with padding (general case). Applies a 2D PyConv over an input signal composed of several input planes.
+
+    Args:
+        in_channels (int): Number of channels in the input image
+        out_channels (int): Number of channels for output feature map
+        pyconv_kernels (list): Spatial size of the kernel for each pyramid level
+        pyconv_groups (list): Number of blocked connections from input channels to output channels for each pyramid level
+        stride (int or tuple, optional): Stride of the convolution. Default: 1
+        dilation (int or tuple, optional): Spacing between kernel elements. Default: 1
+        bias (bool, optional): If ``True``, adds a learnable bias to the output. Default: ``False``
+    """
+
+    def __init__(self, in_channels, out_channels, r=2, pyconv_kernels=None, pyconv_groups=None,
+                 stride=1, dilation=1, bias=False):
+        super(PyConv2dAttention, self).__init__()
+
+        if pyconv_groups is None:
+            pyconv_groups = [1, 4, 8]
+        if pyconv_kernels is None:
+            pyconv_kernels = [3, 5, 7]
+
+        d = max(int(in_channels / r), 32)
+
+        split_channels = self._set_channels(out_channels, len(pyconv_kernels))
+        self.pyconv_levels = nn.ModuleList([])
+        for i in range(len(pyconv_kernels)):
+            self.pyconv_levels.append(nn.Conv2d(in_channels, split_channels[i], kernel_size=pyconv_kernels[i],
+                                                stride=stride, padding=pyconv_kernels[i] // 2, groups=pyconv_groups[i],
+                                                dilation=dilation, bias=bias))
+
+        self.fc = nn.Linear(out_channels, d)
+        self.fcs = nn.ModuleList([])
+        for _ in range(len(pyconv_kernels)):
+            self.fcs.append(nn.Linear(d, out_channels))
+
+        self.softmax = nn.Softmax(dim=1)
+
+        self.att1 = AttentionLayer(split_channels[0])
+        self.att2 = AttentionLayer(split_channels[1])
+        self.att3 = AttentionLayer(split_channels[2])
+
+    def forward(self, x):
+        feas = [layer(x) for layer in self.pyconv_levels]
+        out = [self.att1(feas[0]), self.att2(feas[1]), self.att3(feas[2])]
+        out = torch.cat(out, dim=1)
+        return out
+
+    def _set_channels(self, out_channels, levels):
+        if levels == 1:
+            split_channels = [out_channels]
+        elif levels == 2:
+            split_channels = [out_channels // 2 for _ in range(2)]
+        elif levels == 3:
+            split_channels = [out_channels // 4, out_channels // 4, out_channels // 2]
+        elif levels == 4:
+            split_channels = [out_channels // 4 for _ in range(4)]
+        else:
+            raise NotImplementedError
+        return split_channels
+
+
+class RDBN(nn.Module):
+    def __init__(self, nf=64, gc=32, n=3):
+        super(RDBN, self).__init__()
+        self.conv = nn.ModuleList()
+        for i in range(n):
+            if i == n - 1:
+
+                self.conv.add_module('PyConv%d' % i, PyConv2dAttention(nf + gc * i, nf))
+            else:
+                self.conv.add_module('Conv%d' % i, nn.Conv2d(nf + gc * i, gc, 3, padding=1))
+
+        # self.pyconv_att = PyConv2dAttention(nf, nf, attention=True)
+
+        self.lrelu = nn.LeakyReLU(negative_slope=0.05, inplace=True)
+        # self.al = AttentionLayer(nf)
+        self.n = n
+
+    def forward(self, x):
+        out = [x]
+
+        for i, layer in enumerate(self.conv):
+            if i == 0:
+                out.append(self.lrelu(layer(x)))
+            elif i == self.n - 1:
+                out.append(layer(torch.cat(out, dim=1)))
+            else:
+                out.append(self.lrelu(layer(torch.cat(out, dim=1))))
+
+        y = out[-1]
+        return x + y
+
+
+class PIPNet(nn.Module):
     def __init__(self, opt):
-        super(GrowingGenerator, self).__init__()
-        self.opt = opt
+        super(PIPNet, self).__init__()
+        self.activation = get_activation(opt)
+        if opt.batch_norm:
+            self.bn = nn.BatchNorm2d(opt.nf)
 
-        RRDB_block_f = functools.partial(ResidualDenseBlock5C)
-        self.RRDB_trunk = make_layer(RRDB_block_f, 1)
+        self.head = ConvBlock(opt.nc_im, opt.nf, opt.ker_size, 1, opt)
 
-        self._pad = nn.ZeroPad2d(1)
-        # self._pad_block = nn.ZeroPad2d(opt.num_layer - 1)
-
-        # main stream
-        self.head = nn.Conv2d(opt.nc_im, opt.nf, opt.ker_size, 1, padding=0)
-
-        self.body = torch.nn.ModuleList([])
+        self.body = nn.ModuleList()
         _first_stage = nn.Sequential()
         for i in range(opt.G_num_blocks):
-            _first_stage.add_module('block%d' % i, self.RRDB_trunk)
+            block = RDBN(opt.nf, opt.gc, opt.nl_in_block)
+            _first_stage.add_module('block%d' % i, block)
         self.body.append(_first_stage)
 
         self.tail = nn.Sequential(
-            nn.Conv2d(opt.nf, opt.nc_im, kernel_size=opt.ker_size, padding=0),
-            nn.Tanh())
+            nn.Conv2d(opt.nf, opt.nc_im, kernel_size=3, padding=1),
+            nn.Tanh()
+        )
+
+    def forward(self, noise, in_data, real_shapes, noise_amp):
+        x_prev_out = self.head(in_data)
+        for idx, block in enumerate(self.body):
+            x_prev_out = upsample(x_prev_out, size=[real_shapes[idx + 1][2], real_shapes[idx + 1][3]])
+            x_prev_out = block(x_prev_out + noise[idx + 1] * noise_amp[idx])
+
+        out = self.tail(x_prev_out)
+        return out
 
     def init_next_stage(self):
         self.body.append(copy.deepcopy(self.body[-1]))
-
-    def forward(self, noise, real_shapes, noise_amp):
-        x = self.head(self._pad(noise[0]))  # SR不变
-
-        # we do some upsampling for training models for unconditional generation to increase
-        # the image diversity at the edges of generated images
-        # x = upsample(x, size=[x.shape[2] + 2, x.shape[3] + 2])
-        # x = self._pad_block(x)
-        x_prev_out = self.body[0](x)  # SR不变
-
-        for idx, block in enumerate(self.body[1:], 1):
-            # x_prev_out_1 = upsample(x_prev_out, size=[real_shapes[idx][2], real_shapes[idx][3]])
-            # x_prev_out_2 = upsample(x_prev_out, size=[real_shapes[idx][2] + self.opt.num_layer * 2,
-            #                                           real_shapes[idx][3] + self.opt.num_layer * 2])
-            # x_prev = block(x_prev_out_1 + noise[idx] * noise_amp[idx])
-            # x_prev_out = x_prev + x_prev_out_1
-            x_prev_out = upsample(x_prev_out, size=[real_shapes[idx][2], real_shapes[idx][3]])
-            # x_prev_out = block(x_prev_out + noise[idx] * noise_amp[idx]) + x_prev_out
-            x_prev_out = block(x_prev_out + noise[idx] * noise_amp[idx])
-
-        out = self.tail(self._pad(x_prev_out))
-        return out
 
 
 class Discriminator(nn.Module):
     def __init__(self, opt):
         super(Discriminator, self).__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(opt.nc_im, 64, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2),
 
-        self.opt = opt
-        N = int(opt.nf)
+            nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.2),
 
-        self.head = ConvBlock(opt.nc_im, N, opt.ker_size, 0, opt)
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2),
 
-        self.body = nn.Sequential()
-        for i in range(opt.D_num_layer):
-            block = ConvBlock(N, N, opt.ker_size, 0, opt)
-            self.body.add_module('block%d' % i, block)
+            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2),
 
-        self.tail = nn.Conv2d(N, 1, kernel_size=opt.ker_size, padding=0)
-        # self.avgpool = nn.AvgPool2d(3, 1)
-        self.sigmoid = nn.Sigmoid()
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.2),
+
+            nn.Conv2d(256, 256, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.2),
+
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.2),
+
+            nn.Conv2d(512, 512, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.2),
+
+            # 把图像大小变成1*1
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(512, 1024, kernel_size=1),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(1024, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
-        head = self.head(x)
-        body = self.body(head)
-        out = self.tail(body)
-        # out = self.avgpool(out)
-        return torch.mean(self.sigmoid(out))
-        # return out
-
-
-def swish(x):
-    return x * F.sigmoid(x)
-
-
-# class Discriminator(nn.Module):
-#     def __init__(self, opt):
-#         super(Discriminator, self).__init__()
-#         self.conv1 = nn.Conv2d(3, 64, 3, stride=1, padding=1)
-#
-#         self.conv2 = nn.Conv2d(64, 64, 3, stride=2, padding=1)
-#         self.bn2 = nn.BatchNorm2d(64)
-#
-#         self.conv3 = nn.Conv2d(64, 128, 3, stride=1, padding=1)
-#         self.bn3 = nn.BatchNorm2d(128)
-#
-#         self.conv4 = nn.Conv2d(128, 128, 3, stride=2, padding=1)
-#         self.bn4 = nn.BatchNorm2d(128)
-#
-#         self.conv5 = nn.Conv2d(128, 256, 3, stride=1, padding=1)
-#         self.bn5 = nn.BatchNorm2d(256)
-#
-#         self.conv6 = nn.Conv2d(256, 256, 3, stride=2, padding=1)
-#         self.bn6 = nn.BatchNorm2d(256)
-#
-#         self.conv7 = nn.Conv2d(256, 512, 3, stride=1, padding=1)
-#         self.bn7 = nn.BatchNorm2d(512)
-#
-#         self.conv8 = nn.Conv2d(512, 512, 3, stride=2, padding=1)
-#         self.bn8 = nn.BatchNorm2d(512)
-#
-#         # Replaced original paper FC layers with FCN
-#         self.conv9 = nn.Conv2d(512, 1, 1, stride=1, padding=1)
-#         self.avgpool = nn.AvgPool2d(3, 1)
-#         self.sigmoid = nn.Sigmoid()
-#
-#     def forward(self, x):
-#         x = swish(self.conv1(x))
-#
-#         x = swish(self.bn2(self.conv2(x)))
-#         x = swish(self.bn3(self.conv3(x)))
-#         x = swish(self.bn4(self.conv4(x)))
-#         x = swish(self.bn5(self.conv5(x)))
-#         x = swish(self.bn6(self.conv6(x)))
-#         x = swish(self.bn7(self.conv7(x)))
-#         x = swish(self.bn8(self.conv8(x)))
-#
-#         x = self.conv9(x)
-#         x = self.avgpool()
-#         # 变成列向量
-#         return F.sigmoid(F.avg_pool2d(x, x.size()[2:])).view(x.size()[0], -1)
+        return self.net(x).view(-1)

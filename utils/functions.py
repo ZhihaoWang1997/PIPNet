@@ -270,16 +270,6 @@ def load_config(opt):
     return opt
 
 
-# class Vgg19Feature(nn.Module):
-#     def __init__(self):
-#         super(Vgg19Feature, self).__init__()
-#         vgg19_model = vgg19(pretrained=True)
-#         self.feature_extractor = nn.Sequential(*list(vgg19_model.features.children())[:18])
-#
-#     def forward(self, img):
-#         return self.feature_extractor(img)
-
-
 # 计算生成器content loss所需的特征图
 class FeatureExtractor(nn.Module):
     def __init__(self, feature_layer=11):
